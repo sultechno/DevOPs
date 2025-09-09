@@ -1,0 +1,608 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import time
+import json
+import socket
+import logging
+from datetime import datetime, timezone
+from collections import defaultdict
+
+import mysql.connector
+
+# ---------- Configuration ----------
+OUT_DIR = os.getenv("EXPORTER_OUT_DIR", "/var/lib/node_exporter")
+COMBINED_PROM = os.path.join(OUT_DIR, "mysql_combined_metrics.prom")
+
+
+MYSQL_HOST = os.getenv("MYSQL_HOST", "localhost")
+MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
+MYSQL_USER = os.getenv("MYSQL_USER", "mysqld_exporter")
+MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "strong_password")
+SCRAPE_INTERVAL = int(os.getenv("SCRAPE_INTERVAL", "30"))
+
+# ---------- Logging ----------
+logging.basicConfig(stream=sys.stdout, level=logging.INFO,
+                    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logger = logging.getLogger("combined_exporter")
+
+# ---------- Utilities ----------
+def sanitize_label_value(value, max_len=128):
+    if value is None:
+        return ""
+    s = str(value)
+    s = s.replace("\n", " ").replace("\r", " ").replace('"', "_").replace("\\", "_")
+    s = " ".join(s.split())
+    return s[:max_len]
+
+def sanitize_label_for_metric(value, max_len=64):
+    if value is None:
+        return "unknown"
+    s = str(value)
+    s = s.replace("\n", " ").replace("\r", " ").replace('"', "_").replace("\\", "_")
+    s = " ".join(s.split())
+    return s[:max_len]
+
+def atomic_write(path, content):
+    tmp = f"{path}.tmp"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(tmp, "w") as f:
+        f.write(content)
+    os.replace(tmp, path)
+
+# ---------- Database access wrapper ----------
+class DB:
+    def __init__(self, host, port, user, password):
+        self.config = {
+            "host": host,
+            "port": port,
+            "user": user,
+            "password": password,
+            "autocommit": True,
+            "charset": "utf8mb4",
+            "connection_timeout": 10
+        }
+        self.conn = None
+
+    def connect(self):
+        try:
+            if self.conn and getattr(self.conn, "is_connected", lambda: False)():
+                return True
+            self.conn = mysql.connector.connect(**self.config)
+            return True
+        except Exception as e:
+            logger.error("MySQL connect failed: %s", e)
+            return False
+
+    def query(self, q, desc=""):
+        try:
+            if not self.connect():
+                return []
+            cur = self.conn.cursor(dictionary=True)
+            cur.execute(q)
+            rows = cur.fetchall()
+            cur.close()
+            return rows
+        except Exception as e:
+            logger.error("Query failed%s: %s", f" ({desc})" if desc else "", str(e)[:200])
+            try:
+                # try one reconnect
+                if self.conn:
+                    self.conn.reconnect(attempts=1, delay=0)
+                    cur = self.conn.cursor(dictionary=True)
+                    cur.execute(q)
+                    rows = cur.fetchall()
+                    cur.close()
+                    return rows
+            except Exception as e2:
+                logger.error("Retry failed%s: %s", f" ({desc})" if desc else "", str(e2)[:200])
+            return []
+
+# ---------- Collectors (adapted logics from both scripts) ----------
+class Collector:
+    def __init__(self, db: DB, hostname=None, instance=None):
+        self.db = db
+        self.hostname = hostname or socket.gethostname()
+        self.instance = instance or f"{MYSQL_HOST}:{MYSQL_PORT}"
+
+    # --- processlist / active queries (from custom_mysql_metrics) ---
+    def get_active_queries(self, limit=500):
+        q = """
+        SELECT ID, USER, HOST, DB, COMMAND, TIME, STATE, INFO, PROGRESS
+        FROM information_schema.processlist
+        WHERE COMMAND <> 'Sleep'
+        ORDER BY TIME DESC
+        LIMIT %s
+        """ % (limit,)
+        return self.db.query(q, "processlist")
+
+    # --- user statistics if table exists ---
+    def get_user_statistics(self):
+        q = """
+        SELECT USER, TOTAL_CONNECTIONS, CONCURRENT_CONNECTIONS
+        FROM information_schema.USER_STATISTICS
+        """
+        return self.db.query(q, "user statistics")
+
+    # --- replication (based on custom_mysql_metrics.get_replication_status) ---
+    def get_replication_status(self):
+        metrics = {}
+        try:
+            slave_status = self.db.query("SHOW SLAVE STATUS", "slave status")
+            metrics["is_slave"] = 1 if slave_status and len(slave_status) > 0 else 0
+            if metrics["is_slave"]:
+                ss = slave_status[0]
+                metrics["slave_io_running"] = 1 if ss.get("Slave_IO_Running") == "Yes" else 0
+                metrics["slave_sql_running"] = 1 if ss.get("Slave_SQL_Running") == "Yes" else 0
+                metrics["seconds_behind"] = ss.get("Seconds_Behind_Master") or 0
+                metrics["master_host"] = ss.get("Master_Host", "")
+                metrics["master_port"] = ss.get("Master_Port", "")
+                metrics["master_log_file"] = ss.get("Master_Log_File", "")
+                metrics["read_master_log_pos"] = ss.get("Read_Master_Log_Pos", 0)
+                metrics["relay_master_log_file"] = ss.get("Relay_Master_Log_File", "")
+                metrics["exec_master_log_pos"] = ss.get("Exec_Master_Log_Pos", 0)
+                metrics["relay_log_file"] = ss.get("Relay_Log_File", "")
+                metrics["relay_log_pos"] = ss.get("Relay_Log_Pos", 0)
+                metrics["last_io_error"] = ss.get("Last_IO_Error", "")
+                metrics["last_sql_error"] = ss.get("Last_SQL_Error", "")
+                metrics["slave_sql_running_state"] = ss.get("Slave_SQL_Running_State", "")
+                metrics["master_retry_count"] = ss.get("Master_Retry_Count", 0)
+                metrics["master_server_id"] = ss.get("Master_Server_Id", 0)
+                metrics["slave_io_state"] = ss.get("Slave_IO_State", "")
+                metrics["master_user"] = ss.get("Master_User", "")
+                metrics["connect_retry"] = ss.get("Connect_Retry", 0)
+                metrics["replicate_do_db"] = ss.get("Replicate_Do_DB", "")
+                metrics["replicate_ignore_db"] = ss.get("Replicate_Ignore_DB", "")
+                metrics["replicate_do_table"] = ss.get("Replicate_Do_Table", "")
+                metrics["replicate_ignore_table"] = ss.get("Replicate_Ignore_Table", "")
+                metrics["replicate_wild_do_table"] = ss.get("Replicate_Wild_Do_Table", "")
+                metrics["replicate_wild_ignore_table"] = ss.get("Replicate_Wild_Ignore_Table", "")
+                metrics["until_condition"] = ss.get("Until_Condition", "")
+                metrics["until_log_file"] = ss.get("Until_Log_File", "")
+                metrics["until_log_pos"] = ss.get("Until_Log_Pos", 0)
+                metrics["ssl_verify_server_cert"] = 1 if ss.get("SSL_Verify_Server_Cert") == "Yes" else 0
+                metrics["ssl_allowed"] = 1 if ss.get("Ssl_Allowed") == "Yes" else 0
+                metrics["replication_lag"] = metrics["seconds_behind"]
+            else:
+                metrics["slave_io_running"] = 0
+                metrics["slave_sql_running"] = 0
+                metrics["seconds_behind"] = 0
+                metrics["replication_lag"] = 0
+
+            master_status = self.db.query("SHOW MASTER STATUS", "master status")
+            has_master_status = master_status and len(master_status) > 0
+            metrics["is_master"] = 1 if has_master_status and metrics["is_slave"] == 0 else 0
+            if metrics["is_master"]:
+                ms = master_status[0]
+                metrics["master_file"] = ms.get("File", "")
+                metrics["master_position"] = ms.get("Position", 0)
+                metrics["binlog_do_db"] = ms.get("Binlog_Do_DB", "")
+                metrics["binlog_ignore_db"] = ms.get("Binlog_Ignore_DB", "")
+                slave_hosts = self.db.query("SHOW SLAVE HOSTS", "slave hosts")
+                metrics["slave_hosts"] = slave_hosts or []
+                metrics["slave_hosts_count"] = len(metrics["slave_hosts"])
+            else:
+                metrics["slave_hosts"] = []
+                metrics["slave_hosts_count"] = 0
+
+        except Exception as e:
+            logger.error("Error collecting replication: %s", e)
+            metrics["is_slave"] = 0
+            metrics["is_master"] = 0
+            metrics["slave_io_running"] = 0
+            metrics["slave_sql_running"] = 0
+            metrics["seconds_behind"] = 0
+            metrics["replication_lag"] = 0
+            metrics["slave_hosts"] = []
+            metrics["slave_hosts_count"] = 0
+        return metrics
+
+    # --- innodb stats and table IO / wait events from the mariadb collector ---
+    def get_innodb_stats(self):
+        q = """
+        SELECT VARIABLE_NAME as stat_name, VARIABLE_VALUE as stat_value
+        FROM performance_schema.global_status
+        WHERE VARIABLE_NAME LIKE 'Innodb_%'
+          AND VARIABLE_VALUE REGEXP '^[0-9]+(\\.[0-9]+)?$'
+        """
+        return self.db.query(q, "innodb status")
+
+    def get_table_io_waits(self):
+        q = """
+        SELECT
+            OBJECT_SCHEMA as database_name,
+            OBJECT_NAME as table_name,
+            SUM(COUNT_STAR) as total_io_requests,
+            ROUND(SUM(SUM_TIMER_WAIT)/1e12, 6) as total_io_wait_time_sec
+        FROM performance_schema.table_io_waits_summary_by_table
+        WHERE COUNT_STAR > 0
+          AND OBJECT_SCHEMA NOT IN ('mysql','information_schema','performance_schema','sys')
+        GROUP BY OBJECT_SCHEMA, OBJECT_NAME
+        ORDER BY total_io_wait_time_sec DESC
+        LIMIT 200
+        """
+        return self.db.query(q, "table io waits")
+
+    def get_wait_events(self):
+        q = """
+        SELECT
+            SUBSTRING_INDEX(EVENT_NAME, '/', 1) AS event_category,
+            SUBSTRING_INDEX(SUBSTRING_INDEX(EVENT_NAME, '/', 2), '/', -1) AS event_type,
+            SUM(COUNT_STAR) AS wait_count,
+            ROUND(SUM(SUM_TIMER_WAIT) / 1e12, 6) AS total_wait_time_sec
+        FROM performance_schema.events_waits_summary_global_by_event_name
+        WHERE COUNT_STAR > 0 AND SUM_TIMER_WAIT > 0
+        GROUP BY event_category, event_type
+        ORDER BY total_wait_time_sec DESC
+        LIMIT 300
+        """
+        return self.db.query(q, "wait events")
+
+    def get_performance_digest(self):
+        q = """
+        SELECT
+            COALESCE(esd.DIGEST, 'N/A') AS query_id,
+            COALESCE(LEFT(esd.DIGEST_TEXT, 500), 'No query text') AS query_text,
+            COALESCE(esd.SCHEMA_NAME, 'Unknown') AS database_name,
+            esd.COUNT_STAR AS execution_count,
+            ROUND(esd.SUM_TIMER_WAIT / 1e12, 6) AS total_latency_sec,
+            ROUND(esd.AVG_TIMER_WAIT / 1e12, 6) AS avg_latency_sec,
+            ROUND(esd.MAX_TIMER_WAIT / 1e12, 6) AS max_latency_sec,
+            ROUND(esd.SUM_LOCK_TIME / 1e12, 6) AS total_lock_time_sec,
+            esd.SUM_ROWS_EXAMINED AS total_rows_examined,
+            esd.SUM_ROWS_SENT AS total_rows_sent,
+            esd.SUM_ROWS_AFFECTED AS total_rows_affected,
+            esd.SUM_CREATED_TMP_TABLES AS tmp_tables_created,
+            esd.SUM_CREATED_TMP_DISK_TABLES AS tmp_disk_tables_created,
+            esd.SUM_SELECT_FULL_JOIN AS full_joins,
+            esd.SUM_SELECT_SCAN AS full_scans,
+            esd.SUM_SORT_MERGE_PASSES AS sort_merge_passes,
+            esd.SUM_NO_INDEX_USED AS no_index_used_count,
+            esd.SUM_NO_GOOD_INDEX_USED AS no_good_index_used_count,
+            CASE
+                WHEN esd.AVG_TIMER_WAIT / 1e12 > 1 THEN 'SLOW'
+                WHEN esd.AVG_TIMER_WAIT / 1e12 > 0.1 THEN 'MODERATE'
+                ELSE 'FAST'
+            END AS performance_category,
+            CASE
+                WHEN esd.SUM_ROWS_EXAMINED > 0 AND esd.SUM_ROWS_SENT > 0
+                     AND esd.SUM_ROWS_EXAMINED / esd.SUM_ROWS_SENT > 1000 THEN 'HIGH_SCAN_RATIO'
+                WHEN esd.SUM_NO_INDEX_USED > 0 THEN 'NO_INDEX'
+                WHEN esd.SUM_CREATED_TMP_DISK_TABLES > 0 THEN 'DISK_TMP_TABLES'
+                ELSE 'OPTIMIZED'
+            END AS resource_indicator,
+            CASE
+                WHEN esd.AVG_TIMER_WAIT / 1e12 > 1 THEN 'ALERT: Very slow query'
+                WHEN esd.SUM_NO_INDEX_USED > 0 THEN 'WARNING: No index used'
+                WHEN esd.SUM_CREATED_TMP_DISK_TABLES > 0 THEN 'WARNING: Disk temp tables'
+                WHEN esd.SUM_ROWS_EXAMINED > 0 AND esd.SUM_ROWS_SENT > 0
+                     AND esd.SUM_ROWS_EXAMINED / esd.SUM_ROWS_SENT > 1000 THEN 'WARNING: High scan ratio'
+                ELSE 'OK'
+            END AS monitoring_alert,
+            CASE
+                WHEN esd.DIGEST_TEXT LIKE 'SELECT%' THEN 'SELECT'
+                WHEN esd.DIGEST_TEXT LIKE 'INSERT%' THEN 'INSERT'
+                WHEN esd.DIGEST_TEXT LIKE 'UPDATE%' THEN 'UPDATE'
+                WHEN esd.DIGEST_TEXT LIKE 'DELETE%' THEN 'DELETE'
+                WHEN esd.DIGEST_TEXT LIKE 'CREATE%' THEN 'DDL'
+                WHEN esd.DIGEST_TEXT LIKE 'ALTER%' THEN 'DDL'
+                WHEN esd.DIGEST_TEXT LIKE 'DROP%' THEN 'DDL'
+                ELSE 'OTHER'
+            END AS event_type,
+            esd.FIRST_SEEN,
+            esd.LAST_SEEN
+        FROM performance_schema.events_statements_summary_by_digest esd
+        WHERE esd.COUNT_STAR > 0 AND esd.SUM_TIMER_WAIT > 0
+        ORDER BY esd.SUM_TIMER_WAIT DESC, esd.COUNT_STAR DESC
+        LIMIT 200
+        """
+        return self.db.query(q, "performance digest")
+
+# ---------- Build combined metrics text ----------
+def build_combined_text(collector: Collector, collection_time_seconds: float):
+    lines = []
+    # --- Part A: mariadb query performance collector output (reconstruct same metrics) ---
+    # We'll mirror the output format that the mariadb collector used:
+    perf = collector.get_performance_digest()
+    waits = collector.get_wait_events()
+    status = collector.db.query("SHOW GLOBAL STATUS", "global status")  # used by mariadb collector
+    innodb = collector.get_innodb_stats()
+    tableio = collector.get_table_io_waits()
+
+    # Build performance metrics sets (same names as before)
+    metrics_sets = defaultdict(set)
+
+    def fnum(v, default=0.0):
+        try:
+            return float(v)
+        except Exception:
+            return float(default)
+
+    for row in perf or []:
+        qid = sanitize_label_for_metric((row.get("query_id") or "unknown")[:64])
+        dbname = sanitize_label_for_metric(row.get("database_name") or "unknown")
+        event = sanitize_label_for_metric(row.get("event_type") or "query")
+        labels = f'query_id="{qid}",dbname="{dbname}",event="{event}",instance="{collector.instance}",hostname="{collector.hostname}"'
+        metrics_sets['mariadb_query_exec_count'].add(f'mariadb_query_exec_count{{{labels}}} {int(fnum(row.get("execution_count", 0)))}')
+        metrics_sets['mariadb_query_total_time'].add(f'mariadb_query_total_time{{{labels}}} {fnum(row.get("total_latency_sec", 0)):.6f}')
+        metrics_sets['mariadb_query_avg_time'].add(f'mariadb_query_avg_time{{{labels}}} {fnum(row.get("avg_latency_sec", 0)):.6f}')
+        metrics_sets['mariadb_query_rows_examined'].add(f'mariadb_query_rows_examined{{{labels}}} {int(fnum(row.get("total_rows_examined", 0)))}')
+        metrics_sets['mariadb_query_rows_sent'].add(f'mariadb_query_rows_sent{{{labels}}} {int(fnum(row.get("total_rows_sent", 0)))}')
+        # perf score & alert
+        perf_cat = (row.get("performance_category") or "FAST").upper()
+        perf_score = 1 if perf_cat == "FAST" else 0.5 if perf_cat == "MODERATE" else 0
+        alert_text = (row.get("monitoring_alert") or "").upper()
+        alert_level = 2 if "ALERT" in alert_text else 1 if "WARNING" in alert_text else 0
+        metrics_sets['mariadb_query_performance_score'].add(f'mariadb_query_performance_score{{{labels}}} {perf_score}')
+        metrics_sets['mariadb_query_alert_level'].add(f'mariadb_query_alert_level{{{labels}}} {alert_level}')
+
+    # Wait events aggregation
+    wait_count_acc = defaultdict(int)
+    wait_time_acc = defaultdict(float)
+    for r in waits or []:
+        cat = sanitize_label_for_metric(r.get("event_category") or "")
+        et = sanitize_label_for_metric(r.get("event_type") or "")
+        labels = f'event_category="{cat}",event_type="{et}",instance="{collector.instance}",hostname="{collector.hostname}"'
+        wait_count_acc[labels] += int(fnum(r.get("wait_count", 0)))
+        wait_time_acc[labels] += fnum(r.get("total_wait_time_sec", 0.0))
+    for labels, v in wait_count_acc.items():
+        metrics_sets['mariadb_wait_events_count'].add(f'mariadb_wait_events_count{{{labels}}} {v}')
+    for labels, v in wait_time_acc.items():
+        metrics_sets['mariadb_wait_events_total_time'].add(f'mariadb_wait_events_total_time{{{labels}}} {v:.6f}')
+
+    # Status variables -> dynamic metri names mariadb_status_xxx
+    for row in status or []:
+        name = row.get('Variable_name')
+        val = row.get('Value')
+        try:
+            fval = float(val)
+        except Exception:
+            continue
+        metric = f'mariadb_status_{(name or "").lower()}'
+        metrics_sets[metric].add(f'{metric}{{instance="{collector.instance}",hostname="{collector.hostname}"}} {fval}')
+
+    # Innodb stats
+    for row in innodb or []:
+        stat = sanitize_label_for_metric(row.get("stat_name") or "")
+        try:
+            sval = float(row.get("stat_value", 0))
+        except Exception:
+            continue
+        labels = f'stat_name="{stat}",instance="{collector.instance}",hostname="{collector.hostname}"'
+        metrics_sets['mariadb_innodb_metric'].add(f'mariadb_innodb_metric{{{labels}}} {sval}')
+
+    # Table IO waits (as mariadb_table_io_wait_seconds_total and mariadb_table_io_requests_total)
+    table_seen = set()
+    for row in tableio or []:
+        dbn = sanitize_label_for_metric(row.get("database_name") or "unknown")
+        tbl = sanitize_label_for_metric(row.get("table_name") or "unknown")
+        key = (dbn, tbl)
+        if key in table_seen:
+            continue
+        table_seen.add(key)
+        labels = f'database="{dbn}",table="{tbl}",instance="{collector.instance}",hostname="{collector.hostname}"'
+        metrics_sets['mariadb_table_io_requests_total'].add(f'mariadb_table_io_requests_total{{{labels}}} {int(fnum(row.get("total_io_requests", 0)))}')
+        metrics_sets['mariadb_table_io_wait_seconds_total'].add(f'mariadb_table_io_wait_seconds_total{{{labels}}} {fnum(row.get("total_io_wait_time_sec", 0.0)):.6f}')
+
+    # Build deterministic text
+    for metric_name in sorted(metrics_sets.keys()):
+        help_text = "MariaDB metric"
+        # short map for some known names
+        if metric_name in ('mariadb_query_exec_count',):
+            help_text = 'Number of times the query was executed'
+        lines.append(f'# HELP {metric_name} {help_text}')
+        lines.append(f'# TYPE {metric_name} gauge')
+        for sample in sorted(metrics_sets[metric_name]):
+            lines.append(sample)
+        lines.append("")
+
+    # Add collection time & health and set names same as mariadb collector did
+    lines.append('# HELP mariadb_metrics_collection_seconds Time taken to collect metrics')
+    lines.append('# TYPE mariadb_metrics_collection_seconds gauge')
+    lines.append(f'mariadb_metrics_collection_seconds{{instance="{collector.instance}",hostname="{collector.hostname}"}} {collection_time_seconds:.4f}')
+    lines.append('')
+    lines.append('# HELP mariadb_exporter_healthy Exporter health status')
+    lines.append('# TYPE mariadb_exporter_healthy gauge')
+    lines.append(f'mariadb_exporter_healthy{{instance="{collector.instance}",hostname="{collector.hostname}"}} 1')
+    lines.append('')
+
+    # --- Part B: mysql_custom metrics (processlist, replication, user connections etc) ---
+    metrics = {}  # will hold the same keys like custom exporter
+
+    # processlist/active query counts
+    active = collector.get_active_queries(limit=1000) or []
+    lines.append('# HELP mysql_exporter_healthy Exporter health status (1=healthy)')
+    lines.append('# TYPE mysql_exporter_healthy gauge')
+    lines.append(f'mysql_exporter_healthy{{instance="{collector.instance}",hostname="{collector.hostname}"}} 1')
+    lines.append('')
+    # global connections derived from threads in performance schema we won't re-run threads query, but approximate with count(processlist)
+    lines.append('# HELP mysql_global_connections Total connections')
+    lines.append('# TYPE mysql_global_connections gauge')
+    lines.append(f'mysql_global_connections{{instance="{collector.instance}",hostname="{collector.hostname}"}} {len(active)}')
+    lines.append('')
+    lines.append('# HELP mysql_active_connections Current active connections')
+    lines.append('# TYPE mysql_active_connections gauge')
+    lines.append(f'mysql_active_connections{{instance="{collector.instance}",hostname="{collector.hostname}"}} {len(active)}')
+    lines.append('')
+    lines.append('# HELP mysql_slow_queries_current Currently running slow queries')
+    lines.append('# TYPE mysql_slow_queries_current gauge')
+    # For compatibility leave slow queries count 0 if unknown
+    slow_count = 0
+    lines.append(f'mysql_slow_queries_current{{instance="{collector.instance}",hostname="{collector.hostname}"}} {slow_count}')
+    lines.append('')
+    lines.append('# HELP mysql_lock_waits_current Current lock waits')
+    lines.append('# TYPE mysql_lock_waits_current gauge')
+    lock_waits = collector.get_wait_events() or []
+    lines.append(f'mysql_lock_waits_current{{instance="{collector.instance}",hostname="{collector.hostname}"}} {0}')
+    lines.append('')
+
+    # user_statistics: first try information_schema.USER_STATISTICS, else fallback compute from processlist
+    user_stats = collector.get_user_statistics()
+    user_conn_map = {}
+    user_concurrent_map = {}
+    if user_stats:
+        for us in user_stats:
+            u = sanitize_label_for_metric(us.get("USER") or us.get("user") or "unknown")
+            total = int(us.get("TOTAL_CONNECTIONS") or 0)
+            conc = int(us.get("CONCURRENT_CONNECTIONS") or 0)
+            user_conn_map[u] = total
+            user_concurrent_map[u] = conc
+    else:
+        # fallback: derive current connections by counting processlist rows per user,
+        # and concurrent (running) as those not Sleeping.
+        for row in active:
+            user = sanitize_label_for_metric(row.get("USER") or row.get("user") or "unknown")
+            user_conn_map[user] = user_conn_map.get(user, 0) + 1
+            cmd = (row.get("COMMAND") or row.get("command") or "").lower()
+            if cmd != "sleep":
+                user_concurrent_map[user] = user_concurrent_map.get(user, 0) + 1
+            else:
+                user_concurrent_map.setdefault(user, 0)
+
+    # write mysql_user_connections and mysql_user_concurrent_connections
+    lines.append('# HELP mysql_user_connections Total connections per user')
+    lines.append('# TYPE mysql_user_connections gauge')
+    for u in sorted(user_conn_map.keys()):
+        lines.append(f'mysql_user_connections{{user="{u}",instance="{collector.instance}",hostname="{collector.hostname}"}} {int(user_conn_map[u])}')
+    lines.append('')
+    lines.append('# HELP mysql_user_concurrent_connections Concurrent connections per user')
+    lines.append('# TYPE mysql_user_concurrent_connections gauge')
+    for u in sorted(user_concurrent_map.keys()):
+        lines.append(f'mysql_user_concurrent_connections{{user="{u}",instance="{collector.instance}",hostname="{collector.hostname}"}} {int(user_concurrent_map.get(u,0))}')
+    lines.append('')
+
+    # Active queries presence (legacy)
+    lines.append('# HELP mysql_active_queries Active queries count')
+    lines.append('# TYPE mysql_active_queries gauge')
+    # Build one series per active query with user/db/state label
+    for q in active:
+        user = sanitize_label_for_metric(q.get("USER") or q.get("user") or "unknown")
+        db = sanitize_label_for_metric(q.get("DB") or q.get("db") or "unknown")
+        state = sanitize_label_for_metric(q.get("STATE") or q.get("state") or "unknown")
+        lines.append(f'mysql_active_queries{{user="{user}",db="{db}",state="{state}",instance="{collector.instance}",hostname="{collector.hostname}"}} 1')
+    lines.append('')
+
+    # collection time for mysql_custom side
+    lines.append('# HELP mysql_metrics_collection_seconds Time taken to collect metrics')
+    lines.append('# TYPE mysql_metrics_collection_seconds gauge')
+    lines.append(f'mysql_metrics_collection_seconds{{instance="{collector.instance}",hostname="{collector.hostname}"}} {collection_time_seconds:.4f}')
+    lines.append('')
+
+    # ---------- Replication metrics: write all fields and ensure master_info ALWAYS present ----------
+    rep = collector.get_replication_status() or {}
+    # basic metrics
+    lines.append('# HELP mysql_replication_is_slave Whether this instance is a slave (1/0)')
+    lines.append('# TYPE mysql_replication_is_slave gauge')
+    lines.append(f'mysql_replication_is_slave{{instance="{collector.instance}",hostname="{collector.hostname}"}} {rep.get("is_slave",0)}')
+    lines.append('')
+    lines.append('# HELP mysql_replication_is_master Whether this instance is a master (1/0)')
+    lines.append('# TYPE mysql_replication_is_master gauge')
+    lines.append(f'mysql_replication_is_master{{instance="{collector.instance}",hostname="{collector.hostname}"}} {rep.get("is_master",0)}')
+    lines.append('')
+    lines.append('# HELP mysql_replication_slave_io_running Slave IO thread running (1/0)')
+    lines.append('# TYPE mysql_replication_slave_io_running gauge')
+    lines.append(f'mysql_replication_slave_io_running{{instance="{collector.instance}",hostname="{collector.hostname}"}} {rep.get("slave_io_running",0)}')
+    lines.append('')
+    lines.append('# HELP mysql_replication_slave_sql_running Slave SQL thread running (1/0)')
+    lines.append('# TYPE mysql_replication_slave_sql_running gauge')
+    lines.append(f'mysql_replication_slave_sql_running{{instance="{collector.instance}",hostname="{collector.hostname}"}} {rep.get("slave_sql_running",0)}')
+    lines.append('')
+    lines.append('# HELP mysql_replication_seconds_behind Seconds behind master')
+    lines.append('# TYPE mysql_replication_seconds_behind gauge')
+    lines.append(f'mysql_replication_seconds_behind{{instance="{collector.instance}",hostname="{collector.hostname}"}} {rep.get("seconds_behind",0)}')
+    lines.append('')
+    lines.append('# HELP mysql_replication_lag Replication lag in seconds')
+    lines.append('# TYPE mysql_replication_lag gauge')
+    lines.append(f'mysql_replication_lag{{instance="{collector.instance}",hostname="{collector.hostname}"}} {rep.get("replication_lag",0)}')
+    lines.append('')
+
+    # master info - ensure we always export a series so Grafana query won't be empty
+    # if slave: fill master_host/master_port/master_user from SHOW SLAVE STATUS
+    # if not slave: emit the metric with empty master_host/master_port so a series exists
+    lines.append('# HELP mysql_replication_master_info Slave master connection info')
+    lines.append('# TYPE mysql_replication_master_info gauge')
+    master_host = sanitize_label_for_metric(rep.get("master_host", ""))
+    master_port = sanitize_label_for_metric(rep.get("master_port", ""))
+    master_user = sanitize_label_for_metric(rep.get("master_user", ""))
+    labels = f'instance="{collector.instance}",hostname="{collector.hostname}",master_host="{master_host}",master_port="{master_port}",master_user="{master_user}"'
+    # write always (1 if present)
+    lines.append(f'mysql_replication_master_info{{{labels}}} 1')
+    lines.append('')
+
+    # master binlog info (for masters)
+    if rep.get("is_master", 0) == 1:
+        lines.append('# HELP mysql_replication_binlog_info Master binlog position info')
+        lines.append('# TYPE mysql_replication_binlog_info gauge')
+        binlog_file = sanitize_label_for_metric(rep.get("master_file",""))
+        binlog_pos = rep.get("master_position",0)
+        lines.append(f'mysql_replication_binlog_info{{instance="{collector.instance}",hostname="{collector.hostname}",binlog_file="{binlog_file}",binlog_position="{binlog_pos}"}} 1')
+        lines.append('')
+
+    # slave hosts count and list
+    lines.append('# HELP mysql_replication_slave_hosts_count Number of connected slave hosts')
+    lines.append('# TYPE mysql_replication_slave_hosts_count gauge')
+    lines.append(f'mysql_replication_slave_hosts_count{{instance="{collector.instance}",hostname="{collector.hostname}"}} {rep.get("slave_hosts_count",0)}')
+    lines.append('')
+    if rep.get("slave_hosts"):
+        lines.append('# HELP mysql_replication_slave_host_info Information about connected slave hosts')
+        lines.append('# TYPE mysql_replication_slave_host_info gauge')
+        for slave in rep["slave_hosts"]:
+            server_id = sanitize_label_for_metric(slave.get("Server_id",""))
+            host = sanitize_label_for_metric(slave.get("Host",""))
+            port = sanitize_label_for_metric(slave.get("Port",""))
+            master_id = sanitize_label_for_metric(slave.get("Master_id",""))
+            labels = f'instance="{collector.instance}",hostname="{collector.hostname}",server_id="{server_id}",host="{host}",port="{port}",master_id="{master_id}"'
+            lines.append(f'mysql_replication_slave_host_info{{{labels}}} 1')
+        lines.append('')
+
+    # Finally, per-process metrics: mysql_process_present, mysql_process_time_seconds
+    lines.append('# HELP mysql_process_present Per-process presence (1 = exists)')
+    lines.append('# TYPE mysql_process_present gauge')
+    lines.append('# HELP mysql_process_time_seconds Per-process running time (seconds)')
+    lines.append('# TYPE mysql_process_time_seconds gauge')
+    for r in active[:1000]:
+        pid = str(r.get("ID") or "0")
+        user = sanitize_label_for_metric(r.get("USER") or r.get("user") or "unknown")
+        host = sanitize_label_for_metric(r.get("HOST") or r.get("host") or "unknown")
+        db = sanitize_label_for_metric(r.get("DB") or r.get("db") or "")
+        command = sanitize_label_for_metric(r.get("COMMAND") or r.get("command") or "")
+        state = sanitize_label_for_metric(r.get("STATE") or r.get("state") or "")
+        info = sanitize_label_value(r.get("INFO") or r.get("info") or "", max_len=200)
+        progress = sanitize_label_for_metric(r.get("PROGRESS") or r.get("progress") or "")
+        time_s = float(r.get("TIME") or r.get("time") or 0.0)
+        lab = f'pid="{pid}",user="{user}",host="{host}",db="{db}",command="{command}",state="{state}",info="{info}",progress="{progress}",instance="{collector.instance}",hostname="{collector.hostname}"'
+        lines.append(f'mysql_process_present{{{lab}}} 1')
+        lines.append(f'mysql_process_time_seconds{{{lab}}} {time_s:.3f}')
+    lines.append('')
+
+    # end build
+    return "\n".join(lines)
+
+# ---------- main run loop ----------
+def main():
+    db = DB(MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_PASSWORD)
+    collector = Collector(db=db, hostname=socket.gethostname(), instance=f"{MYSQL_HOST}:{MYSQL_PORT}")
+    logger.info("Starting combined exporter (writing to %s)", COMBINED_PROM)
+
+    while True:
+        try:
+            start = time.time()
+            content = build_combined_text(collector, collection_time_seconds=0.0)  # placeholder for now
+            # measure time precisely
+            collect_end = time.time()
+            collection_time = collect_end - start
+            # rebuild with accurate collection_time
+            content = build_combined_text(collector, collection_time_seconds=collection_time)
+            # atomic write to combined file
+            atomic_write(COMBINED_PROM, content)
+            # Do not write legacy files to avoid duplicates
+            # atomic_write(LEGACY_PROM_1, content)
+            # atomic_write(LEGACY_PROM_2, content)
+            logger.info("Wrote combined metrics (collection_time=%.3fs)", collection_time)
+        except Exception as e:
+            logger.exception("Collection loop failed: %s", e)
+        time.sleep(SCRAPE_INTERVAL)
+
+if __name__ == "__main__":
+    main()
